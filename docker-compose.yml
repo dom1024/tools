@@ -1,0 +1,18 @@
+version: '3.1'
+services:
+  db:
+    image: mariadb:jammy
+    volumes:
+      - ./mysql:/var/lib/mysql
+    restart: always
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--su-mysql", "--connect"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    environment:
+      TZ: Asia/Shanghai
+      MYSQL_ROOT_PASSWORD: your_root_pwd
+      MYSQL_DATABASE: your_dbname
+      MYSQL_USER: user_name
+      MYSQL_PASSWORD: user_pwd
