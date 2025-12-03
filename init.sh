@@ -136,10 +136,3 @@ sysctl --system || sysctl -p /etc/sysctl.d/99-custom.conf || true
 
 echo "[7] vnstat 启用"
 systemctl enable --now vnstat || true
-
-echo "=========================="
-echo " 初始化完成，请注意："
-echo " 1) 确认 /etc/ssh/sshd_config 中的端口为 ${SSH_PORT}，并重启 sshd："
-echo "    sed -i 's/^#\\?Port .*/Port ${SSH_PORT}/' /etc/ssh/sshd_config && systemctl restart ssh"
-echo " 2) 如需 Traffmonetizer："
-echo "    export TM_TOKEN=你的token && bash init-debian.sh"
