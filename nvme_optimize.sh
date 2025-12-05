@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# ssd_nvme_tune.sh
+# nvme_optimize.sh / ssd_nvme_tune.sh
 # 通用 SSD / NVMe / NVMe RAID0 磁盘优化脚本（Linux）
 #
 # 只做这些事：
@@ -12,12 +12,12 @@
 #   - 不分区、不格式化、不修改 RAID 结构
 #
 # 用法：
-#   sudo ./ssd_nvme_tune.sh                 # 自动检测所有 SSD/NVMe 并优化
-#   sudo ./ssd_nvme_tune.sh nvme0n1 md0     # 只优化指定设备
-#   sudo ./ssd_nvme_tune.sh --dry-run       # 只打印将要修改的内容，不真正写入
+#   sudo ./nvme_optimize.sh                 # 自动检测所有 SSD/NVMe 并优化
+#   sudo ./nvme_optimize.sh nvme0n1 md0     # 只优化指定设备
+#   sudo ./nvme_optimize.sh --dry-run       # 只打印将要修改的内容，不真正写入
 #
 
-set -uo pipefail    # 不用 -e，避免某个 echo 失败就退出整个脚本
+set -uo pipefail     # 不用 -e，避免某个 echo 失败就退出整个脚本
 
 DRY_RUN=0
 
@@ -50,32 +50,34 @@ require_root() {
 }
 
 # 安全写 sysfs（失败则 warning，不中断整体执行）
+# 注意用子 shell + 整条命令 2>/dev/null，彻底吞掉 "write error: Invalid argument"
 write_sysfs() {
   local val="$1"
   local path="$2"
 
   if [[ ! -e "$path" ]]; then
     warn "$path 不存在，跳过。"
-    return
+    return 0
   fi
 
   if [[ ! -w "$path" ]]; then
     warn "$path 不可写（只读或权限问题），跳过。"
-    return
+    return 0
   fi
 
   if [[ $DRY_RUN -eq 1 ]]; then
     log "DRY-RUN: echo $val > $path"
-    return
+    return 0
   fi
 
-  # 捕获 echo 失败，不让它触发 set -e（我们本来就没开 -e，但以防你以后加）
-  if ! echo "$val" > "$path" 2>/dev/null; then
+  # 把 echo 放进子 shell，再整体 2>/dev/null，避免 bash 在重定向阶段把错误直接打出来
+  if ! ( echo "$val" > "$path" ) 2>/dev/null; then
     warn "写入失败（可能内核不支持或参数非法）：echo $val > $path"
-    return
+    return 1
   fi
 
   log "设置：$path = $val"
+  return 0
 }
 
 # 自动检测所有 SSD / NVMe 设备（ROTA=0 & TYPE=disk）
@@ -89,6 +91,44 @@ detect_ssd_devices() {
   fi
 
   echo "$list"
+}
+
+# 针对 nr_requests 做智能调整：尝试 1024 -> 512 -> 256
+tune_nr_requests() {
+  local path="$1"
+
+  [[ -f "$path" ]] || return 0
+
+  local cur
+  cur=$(cat "$path" 2>/dev/null || echo "")
+
+  # cur 不是数字就忽略
+  if ! [[ "$cur" =~ ^[0-9]+$ ]]; then
+    cur=""
+  fi
+
+  # 如果当前已经 >= 512，就当它已经不错了，直接跳过
+  if [[ -n "$cur" && "$cur" -ge 512 ]]; then
+    log "nr_requests 当前为 $cur（>=512），保持不变。"
+    return 0
+  fi
+
+  local val
+  for val in 1024 512 256; do
+    # dry-run 模式只是打印
+    if [[ $DRY_RUN -eq 1 ]]; then
+      log "DRY-RUN: 尝试将 $path 设置为 $val"
+      return 0
+    fi
+
+    if ( echo "$val" > "$path" ) 2>/dev/null; then
+      log "nr_requests 设置为 $val"
+      return 0
+    fi
+  done
+
+  warn "无法调整 nr_requests（尝试 1024/512/256 均失败），保持原状${cur:+（当前=$cur）}。"
+  return 0
 }
 
 # 对单个块设备进行优化
@@ -127,7 +167,7 @@ tune_block_device() {
     fi
 
     if [[ -n "$target" ]]; then
-      write_sysfs "$target" "$sched_path"
+      write_sysfs "$target" "$sched_path" || true
     else
       warn "调度器中未发现 none/mq-deadline，可用列表：$avail"
     fi
@@ -135,22 +175,22 @@ tune_block_device() {
     warn "$sched_path 不存在，系统可能强制使用多队列调度。"
   fi
 
-  # 2. 队列深度 nr_requests（不同内核可接受范围不一样，写失败会自动跳过）
+  # 2. 队列深度 nr_requests（自适应）
   local nr_path="$sys_path/queue/nr_requests"
   if [[ -f "$nr_path" ]]; then
-    write_sysfs 1024 "$nr_path"
+    tune_nr_requests "$nr_path"
   fi
 
-  # 3. 预读大小 read_ahead_kb
+  # 3. 预读大小 read_ahead_kb（不会太激进）
   local ra_path="$sys_path/queue/read_ahead_kb"
   if [[ -f "$ra_path" ]]; then
-    write_sysfs 128 "$ra_path"
+    write_sysfs 128 "$ra_path" || true
   fi
 
   # 4. rq_affinity（2 = 更智能地亲和 I/O CPU）
   local rq_path="$sys_path/queue/rq_affinity"
   if [[ -f "$rq_path" ]]; then
-    write_sysfs 2 "$rq_path"
+    write_sysfs 2 "$rq_path" || true
   fi
 
   log "块设备 /dev/$dev 优化完成。"
@@ -169,12 +209,12 @@ tune_nvme_power() {
 
     # power/control: on = 不自动进入 runtime suspend
     if [[ -f "$n/power/control" ]]; then
-      write_sysfs "on" "$n/power/control"
+      write_sysfs "on" "$n/power/control" || true
     fi
 
     # ps_max_latency_us: 尽可能降低延迟；部分平台写 0 会报错，没关系，会 warning 并跳过
     if [[ -f "$n/power/ps_max_latency_us" ]]; then
-      write_sysfs 0 "$n/power/ps_max_latency_us"
+      write_sysfs 0 "$n/power/ps_max_latency_us" || true
     fi
   done
 
