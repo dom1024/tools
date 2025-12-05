@@ -3,22 +3,21 @@
 # ssd_nvme_tune.sh
 # 通用 SSD / NVMe / NVMe RAID0 磁盘优化脚本（Linux）
 #
-# 主要优化内容（仅内核块设备层面）：
-#   - 将调度器设为 none 或 mq-deadline
-#   - 调整 nr_requests（队列深度）
-#   - 调整 read_ahead_kb（预读）
-#   - 设置 rq_affinity=2（亲和当前 CPU）
-#   - 对 NVMe 控制器设置性能电源策略
-#   - 可选：开启 fstrim.timer（周期性 TRIM）
+# 只做这些事：
+#   - 调整块设备队列参数：scheduler / nr_requests / read_ahead_kb / rq_affinity
+#   - 调整 NVMe 控制器电源策略（偏性能）
+#   - 可选：启用 fstrim.timer（如果是 systemd）
 #
-# 使用示例：
+# 不做这些事：
+#   - 不分区、不格式化、不修改 RAID 结构
+#
+# 用法：
 #   sudo ./ssd_nvme_tune.sh                 # 自动检测所有 SSD/NVMe 并优化
-#   sudo ./ssd_nvme_tune.sh nvme0n1 sda     # 只优化指定设备
-#   sudo ./ssd_nvme_tune.sh --dry-run       # 只查看会做什么，不真正修改
+#   sudo ./ssd_nvme_tune.sh nvme0n1 md0     # 只优化指定设备
+#   sudo ./ssd_nvme_tune.sh --dry-run       # 只打印将要修改的内容，不真正写入
 #
-# 建议：放到 /usr/local/sbin 并配合 systemd 启动脚本开机执行。
 
-set -euo pipefail
+set -uo pipefail    # 不用 -e，避免某个 echo 失败就退出整个脚本
 
 DRY_RUN=0
 
@@ -50,27 +49,37 @@ require_root() {
   fi
 }
 
-# 写 sysfs 参数（考虑 dry-run）
+# 安全写 sysfs（失败则 warning，不中断整体执行）
 write_sysfs() {
   local val="$1"
   local path="$2"
 
+  if [[ ! -e "$path" ]]; then
+    warn "$path 不存在，跳过。"
+    return
+  fi
+
   if [[ ! -w "$path" ]]; then
-    warn "无法写入 $path（可能不支持或权限问题），跳过。"
+    warn "$path 不可写（只读或权限问题），跳过。"
     return
   fi
 
   if [[ $DRY_RUN -eq 1 ]]; then
     log "DRY-RUN: echo $val > $path"
-  else
-    echo "$val" > "$path"
-    log "设置：$path = $val"
+    return
   fi
+
+  # 捕获 echo 失败，不让它触发 set -e（我们本来就没开 -e，但以防你以后加）
+  if ! echo "$val" > "$path" 2>/dev/null; then
+    warn "写入失败（可能内核不支持或参数非法）：echo $val > $path"
+    return
+  fi
+
+  log "设置：$path = $val"
 }
 
-# 自动检测所有 SSD / NVMe 设备
+# 自动检测所有 SSD / NVMe 设备（ROTA=0 & TYPE=disk）
 detect_ssd_devices() {
-  # 只选：ROTA=0 且 TYPE=disk
   local list
   list=$(lsblk -ndo NAME,ROTA,TYPE 2>/dev/null | awk '$2==0 && $3=="disk"{print $1}' || true)
 
@@ -93,8 +102,10 @@ tune_block_device() {
   fi
 
   # 检查是否为 SSD（ROTA=0）
-  local rota
-  rota=$(cat "$sys_path/queue/rotational" 2>/dev/null || echo 1)
+  local rota="1"
+  if [[ -f "$sys_path/queue/rotational" ]]; then
+    rota=$(cat "$sys_path/queue/rotational" 2>/dev/null || echo 1)
+  fi
   if [[ "$rota" != "0" ]]; then
     warn "/dev/$dev 是旋转盘（HDD），默认不做 SSD 优化，跳过。"
     return
@@ -102,13 +113,13 @@ tune_block_device() {
 
   log "开始优化块设备：/dev/$dev"
 
-  # 1. 选择调度器：优先 none，其次 mq-deadline
+  # 1. I/O 调度器：优先 none，其次 mq-deadline
   local sched_path="$sys_path/queue/scheduler"
   if [[ -f "$sched_path" ]]; then
     local avail
     avail=$(cat "$sched_path")
-
     local target=""
+
     if echo "$avail" | grep -qw "none"; then
       target="none"
     elif echo "$avail" | grep -qw "mq-deadline"; then
@@ -124,13 +135,13 @@ tune_block_device() {
     warn "$sched_path 不存在，系统可能强制使用多队列调度。"
   fi
 
-  # 2. 队列深度 nr_requests（适度加大）
+  # 2. 队列深度 nr_requests（不同内核可接受范围不一样，写失败会自动跳过）
   local nr_path="$sys_path/queue/nr_requests"
   if [[ -f "$nr_path" ]]; then
     write_sysfs 1024 "$nr_path"
   fi
 
-  # 3. 预读大小 read_ahead_kb（适合多数场景）
+  # 3. 预读大小 read_ahead_kb
   local ra_path="$sys_path/queue/read_ahead_kb"
   if [[ -f "$ra_path" ]]; then
     write_sysfs 128 "$ra_path"
@@ -161,15 +172,9 @@ tune_nvme_power() {
       write_sysfs "on" "$n/power/control"
     fi
 
-    # ps_max_latency_us: 尽可能降低延迟（有些平台不支持写 0，就忽略错误）
+    # ps_max_latency_us: 尽可能降低延迟；部分平台写 0 会报错，没关系，会 warning 并跳过
     if [[ -f "$n/power/ps_max_latency_us" ]]; then
-      if [[ $DRY_RUN -eq 1 ]]; then
-        log "DRY-RUN: echo 0 > $n/power/ps_max_latency_us"
-      else
-        echo 0 > "$n/power/ps_max_latency_us" 2>/dev/null || \
-          warn "$ctrl: 无法写 ps_max_latency_us=0（忽略）。"
-        log "尝试设置 $n/power/ps_max_latency_us = 0（锁定高性能状态，如果支持）。"
-      fi
+      write_sysfs 0 "$n/power/ps_max_latency_us"
     fi
   done
 
@@ -187,13 +192,14 @@ enable_fstrim_timer() {
 
   if [[ $DRY_RUN -eq 1 ]]; then
     log "DRY-RUN: systemctl enable --now fstrim.timer"
+    return
+  fi
+
+  log "启用 fstrim.timer（按周自动对所有挂载点 TRIM）..."
+  if systemctl enable --now fstrim.timer >/dev/null 2>&1; then
+    log "fstrim.timer 已启用。"
   else
-    log "启用 fstrim.timer（按周自动对所有挂载点 TRIM）..."
-    if systemctl enable --now fstrim.timer >/dev/null 2>&1; then
-      log "fstrim.timer 已启用。"
-    else
-      warn "启用 fstrim.timer 失败，请手动执行：systemctl enable --now fstrim.timer"
-    fi
+    warn "启用 fstrim.timer 失败，请手动执行：systemctl enable --now fstrim.timer"
   fi
 }
 
