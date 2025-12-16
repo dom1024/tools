@@ -13,7 +13,7 @@ TM_TOKEN="6Oex+ziyUIz/FGRZq07Wcns1+dmA5xgDm7CCCWG7Mzk="          # 从环境变�
 echo "[0] APT 基础设置与更新"
 export DEBIAN_FRONTEND=noninteractive
 apt update
-apt install -y htop sudo wget curl chrony vnstat fail2ban
+apt install -y htop sudo wget curl chrony vnstat fail2ban unzip
 
 echo "[1] 时间与时区配置"
 if command -v timedatectl >/dev/null 2>&1; then
