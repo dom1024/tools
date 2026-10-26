@@ -181,7 +181,9 @@ try:
     answers=socket.getaddrinfo(domain,443,type=socket.SOCK_STREAM)
     a={ipaddress.ip_address(x[4][0]) for x in answers if x[0]==socket.AF_INET}
     aaaa={ipaddress.ip_address(x[4][0]) for x in answers if x[0]==socket.AF_INET6}
-    local6={ipaddress.ip_address(y['local']) for x in json.load(open(path)) for y in x.get('addr_info',[])}
+    # Incomplete address records have no local address; a peer is not a substitute.
+    local6={ipaddress.ip_address(y['local']) for x in json.load(open(path))
+            for y in x.get('addr_info',[]) if y.get('local')}
     if a != {v4}: raise ValueError('全部 A 记录必须且只能指向指定的公网 IPv4；检查 CDN、DNS 和 /etc/hosts')
     if not aaaa.issubset(local6) or any(not x.is_global for x in aaaa):
         raise ValueError('AAAA 记录不属于本机全局 IPv6，请修正或删除无效 AAAA')
